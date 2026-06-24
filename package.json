@@ -1,0 +1,21 @@
+{
+  "name": "com.devtools.unity-editor-http-server",
+  "version": "1.0.0",
+  "displayName": "Unity Editor HTTP Server",
+  "description": "HTTP server exposing Unity Editor state, TestRunner, logs, and AssetDatabase over localhost. Designed for AI-assisted development workflows (write → compile → test loop).",
+  "unity": "2021.3",
+  "type": "tool",
+  "keywords": [
+    "editor",
+    "testing",
+    "ai",
+    "http",
+    "testrunner",
+    "automation"
+  ],
+  "author": {
+    "name": "Ruben Tomas Gracia",
+    "email": "ruben.tomas.gracia@acentio.com"
+  },
+  "dependencies": {}
+}
