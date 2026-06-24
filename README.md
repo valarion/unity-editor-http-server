@@ -1,5 +1,7 @@
 # Unity Editor HTTP Server
 
+> **This package was designed and implemented through an AI-assisted development session using [Claude](https://claude.ai) (Anthropic). The architecture, all C# code, the OpenAPI spec, and the AI skill files were produced by the model from a conversational prompt, with a human reviewing and directing the work. No code was written by hand.**
+
 A Unity Editor package that exposes an HTTP API on `localhost:8765`, giving AI agents (and other tools) programmatic access to editor state, the TestRunner, the console log, and AssetDatabase — with no GUI interaction required.
 
 ## Endpoints
