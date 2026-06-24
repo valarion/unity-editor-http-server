@@ -34,7 +34,7 @@ A Unity Editor package that exposes an HTTP API on `localhost:8765`, giving AI a
 In Unity's Package Manager, choose **Add package from git URL** and enter:
 
 ```
-https://github.com/YOUR_USERNAME/unity-editor-http-server.git
+https://github.com/valarion/unity-editor-http-server.git
 ```
 
 Or add to your project's `Packages/manifest.json`:
@@ -42,7 +42,7 @@ Or add to your project's `Packages/manifest.json`:
 ```json
 {
   "dependencies": {
-    "com.devtools.unity-editor-http-server": "https://github.com/YOUR_USERNAME/unity-editor-http-server.git"
+    "com.devtools.unity-editor-http-server": "https://github.com/valarion/unity-editor-http-server.git"
   }
 }
 ```
