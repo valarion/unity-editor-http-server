@@ -66,44 +66,62 @@ public static class TestHttpServer
         if (AutoStart) Startup();
     }
 
+    // Full init: always tears down any existing listener and creates a fresh one.
+    // Use this on first start, port change, or domain reload recovery.
     public static void Startup()
     {
         Shutdown();
         var port = ConfiguredPort;
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://localhost:{port}/");
-
-        // Retry a few times with a short delay: on Windows, HTTP.sys can take a
-        // moment to release a URL registration after Abort() even though the call
-        // returned successfully.
-        Exception lastEx = null;
-        for (int attempt = 0; attempt < 5; attempt++)
+        try { _listener.Start(); }
+        catch (Exception ex)
         {
-            if (attempt > 0) Thread.Sleep(50);
-            try { _listener.Start(); lastEx = null; break; }
-            catch (Exception ex) { lastEx = ex; }
-        }
-
-        if (lastEx != null)
-        {
-            Debug.LogError($"[TestHttpServer] Failed to bind port {port}: {lastEx.Message}");
+            Debug.LogError($"[TestHttpServer] Failed to bind port {port}: {ex.Message}");
+            _listener = null;
             return;
         }
-
-        _serverThread = new Thread(ServeLoop) { IsBackground = true, Name = "TestHttpServer" };
-        _serverThread.Start();
+        StartServeThread();
         Debug.Log($"[TestHttpServer] Listening on http://localhost:{port}/  Swagger UI: http://localhost:{port}/swagger");
     }
 
+    // Pause: stop accepting requests but keep the socket reserved.
+    // The same listener can be resumed with Resume() without releasing the port.
+    public static void Pause()
+    {
+        try { _listener?.Stop(); } catch { }
+        _serverThread?.Join(500);
+        _serverThread = null;
+    }
+
+    // Resume a paused listener. The socket was never released so rebinding is not needed.
+    public static void Resume()
+    {
+        if (_listener == null) { Startup(); return; }
+        try { _listener.Start(); }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[TestHttpServer] Failed to resume on port {ConfiguredPort}: {ex.Message}");
+            return;
+        }
+        StartServeThread();
+        Debug.Log($"[TestHttpServer] Resumed on http://localhost:{ConfiguredPort}/");
+    }
+
+    // Full teardown: releases the socket entirely.
+    // Call before domain reload, on quit, or before a port change.
     public static void Shutdown()
     {
-        // Abort() is the forceful path — it immediately invalidates the listener
-        // and releases the HTTP.sys URL registration without waiting for in-flight
-        // requests to drain (unlike Close/Stop which can leave the port bound).
         try { _listener?.Abort(); } catch { }
         _listener = null;
         _serverThread?.Join(500);
         _serverThread = null;
+    }
+
+    static void StartServeThread()
+    {
+        _serverThread = new Thread(ServeLoop) { IsBackground = true, Name = "TestHttpServer" };
+        _serverThread.Start();
     }
 
     public static void SaveConfig(int port, bool autoStart)
@@ -1014,20 +1032,21 @@ public class HttpServerSettingsWindow : EditorWindow
         {
             TestHttpServer.SaveConfig(_port, _autoStart);
             _dirty = false;
-            // Defer out of OnGUI — socket operations must not run inside the GUI event loop.
+            // Full restart needed — port may have changed, so Shutdown + Startup.
             EditorApplication.delayCall += () => { TestHttpServer.Startup(); Repaint(); };
         }
         GUI.enabled = true;
 
         if (running)
         {
+            // Pause keeps the socket reserved — Resume() can rebind without OS timing issues.
             if (GUILayout.Button("Stop"))
-                EditorApplication.delayCall += () => { TestHttpServer.Shutdown(); Repaint(); };
+                EditorApplication.delayCall += () => { TestHttpServer.Pause(); Repaint(); };
         }
         else
         {
             if (GUILayout.Button("Start"))
-                EditorApplication.delayCall += () => { TestHttpServer.Startup(); Repaint(); };
+                EditorApplication.delayCall += () => { TestHttpServer.Resume(); Repaint(); };
         }
 
         EditorGUILayout.EndHorizontal();
