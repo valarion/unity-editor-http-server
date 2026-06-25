@@ -963,6 +963,10 @@ public class HttpServerSettingsWindow : EditorWindow
     bool _autoStart;
     bool _dirty;
 
+    // Cached styles — created once in OnEnable, not every frame.
+    GUIStyle _runningStyle;
+    GUIStyle _stoppedStyle;
+
     [MenuItem("Tools/HTTP Server/Settings")]
     public static void Open() => GetWindow<HttpServerSettingsWindow>("HTTP Server").minSize = new UnityEngine.Vector2(320, 200);
 
@@ -971,24 +975,30 @@ public class HttpServerSettingsWindow : EditorWindow
         _port      = TestHttpServer.ConfiguredPort;
         _autoStart = TestHttpServer.AutoStart;
         _dirty     = false;
+        _runningStyle = null; // rebuilt on first OnGUI once EditorStyles is ready
+        _stoppedStyle = null;
     }
 
     void OnGUI()
     {
+        // Build styles lazily — EditorStyles is not guaranteed to be ready in OnEnable.
+        if (_runningStyle == null)
+        {
+            _runningStyle = new GUIStyle(EditorStyles.boldLabel);
+            _runningStyle.normal.textColor = new UnityEngine.Color(0.2f, 0.8f, 0.2f);
+            _stoppedStyle = new GUIStyle(EditorStyles.boldLabel);
+            _stoppedStyle.normal.textColor = new UnityEngine.Color(0.8f, 0.3f, 0.3f);
+        }
+
         EditorGUILayout.Space(8);
 
-        // Status
-        var statusStyle = new GUIStyle(EditorStyles.boldLabel);
-        statusStyle.normal.textColor = TestHttpServer.IsRunning
-            ? new UnityEngine.Color(0.2f, 0.8f, 0.2f)
-            : new UnityEngine.Color(0.8f, 0.3f, 0.3f);
-        EditorGUILayout.LabelField("Status", TestHttpServer.IsRunning
-            ? $"Running on port {TestHttpServer.ConfiguredPort}"
-            : "Stopped", statusStyle);
+        bool running = TestHttpServer.IsRunning;
+        EditorGUILayout.LabelField("Status",
+            running ? $"Running on port {TestHttpServer.ConfiguredPort}" : "Stopped",
+            running ? _runningStyle : _stoppedStyle);
 
         EditorGUILayout.Space(8);
         EditorGUILayout.LabelField("Configuration", EditorStyles.boldLabel);
-        EditorGUI.BeginChangeCheck();
 
         var newPort = EditorGUILayout.IntField("Port", _port);
         if (newPort != _port) { _port = UnityEngine.Mathf.Clamp(newPort, 1024, 65535); _dirty = true; }
@@ -1004,12 +1014,12 @@ public class HttpServerSettingsWindow : EditorWindow
         {
             TestHttpServer.SaveConfig(_port, _autoStart);
             _dirty = false;
-            // Defer out of OnGUI — socket operations must not block the GUI event loop.
+            // Defer out of OnGUI — socket operations must not run inside the GUI event loop.
             EditorApplication.delayCall += () => { TestHttpServer.Startup(); Repaint(); };
         }
         GUI.enabled = true;
 
-        if (TestHttpServer.IsRunning)
+        if (running)
         {
             if (GUILayout.Button("Stop"))
                 EditorApplication.delayCall += () => { TestHttpServer.Shutdown(); Repaint(); };
@@ -1025,12 +1035,12 @@ public class HttpServerSettingsWindow : EditorWindow
         if (_dirty)
         {
             EditorGUILayout.Space(4);
-            EditorGUILayout.HelpBox("Unsaved changes. Click Apply & Restart to use the new port.", MessageType.Info);
+            EditorGUILayout.HelpBox("Unsaved changes — click Apply & Restart to use the new port.", MessageType.Info);
         }
 
         EditorGUILayout.Space(8);
-        EditorGUILayout.LabelField("Swagger UI", TestHttpServer.IsRunning
-            ? $"http://localhost:{TestHttpServer.ConfiguredPort}/swagger"
-            : "—", EditorStyles.miniLabel);
+        EditorGUILayout.LabelField("Swagger UI",
+            running ? $"http://localhost:{TestHttpServer.ConfiguredPort}/swagger" : "—",
+            EditorStyles.miniLabel);
     }
 }
