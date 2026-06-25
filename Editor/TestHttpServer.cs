@@ -85,7 +85,13 @@ public static class TestHttpServer
 
     public static void Shutdown()
     {
-        try { _listener?.Stop(); _listener = null; } catch { }
+        // Close() releases the socket. Stop() only pauses accepting — the port stays bound.
+        try { _listener?.Close(); } catch { }
+        _listener = null;
+        // Wait for the serve loop thread to exit before returning so Startup()
+        // can safely bind the same port again.
+        _serverThread?.Join(1000);
+        _serverThread = null;
     }
 
     public static void SaveConfig(int port, bool autoStart)
