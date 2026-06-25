@@ -30,6 +30,10 @@ public static class TestHttpServer
     static readonly ConcurrentDictionary<string, CompilerMessage[]> _compilerMessagesByAssembly =
         new ConcurrentDictionary<string, CompilerMessage[]>(StringComparer.OrdinalIgnoreCase);
 
+    // Custom endpoints registered by other assemblies via RegisterEndpoint()
+    static readonly Dictionary<(string method, string path), Action<HttpListenerContext>> _customRoutes =
+        new Dictionary<(string, string), Action<HttpListenerContext>>();
+
     // Asset type aliases for /assets/list?type=X
     static readonly Dictionary<string, string> _typeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
@@ -131,13 +135,91 @@ public static class TestHttpServer
             else if (path == "/assets/list"            && method == "GET")  HandleAssetsList(ctx);
             else if (path == "/swagger/openapi.json"   && method == "GET")  HandleOpenApiSpec(ctx);
             else if ((path == "/swagger" || path == "/swagger/index.html") && method == "GET") HandleSwaggerUi(ctx);
-            else Respond(ctx, 404, "{\"error\":\"not found\"}");
+            else
+            {
+                Action<HttpListenerContext> custom;
+                lock (_customRoutes) _customRoutes.TryGetValue((method, path), out custom);
+                if (custom != null) custom(ctx);
+                else Respond(ctx, 404, "{\"error\":\"not found\"}");
+            }
         }
         catch (Exception ex)
         {
             try { Respond(ctx, 500, $"{{\"error\":{JsonStr(ex.Message)}}}"); }
             catch { }
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Extension API — call these from other assemblies to add custom endpoints
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Register a custom HTTP endpoint. Call from an [InitializeOnLoad] static
+    /// constructor in your own assembly. Built-in routes take precedence.
+    /// </summary>
+    /// <example>
+    /// [InitializeOnLoad]
+    /// public static class MyEndpoints
+    /// {
+    ///     static MyEndpoints()
+    ///     {
+    ///         TestHttpServer.RegisterEndpoint("GET", "/my/data", ctx =>
+    ///         {
+    ///             var result = TestHttpServer.RunOnMainThread(() => MyApi.GetData());
+    ///             TestHttpServer.Respond(ctx, 200, $"{{\"value\":{TestHttpServer.JsonStr(result)}}}");
+    ///         });
+    ///     }
+    /// }
+    /// </example>
+    public static void RegisterEndpoint(string method, string path, Action<HttpListenerContext> handler)
+    {
+        var key = (method.ToUpperInvariant(), path.ToLowerInvariant().TrimEnd('/'));
+        lock (_customRoutes) _customRoutes[key] = handler;
+    }
+
+    /// <summary>
+    /// Dispatch work to Unity's main thread and block until it completes.
+    /// Use this inside endpoint handlers that need to call Unity APIs.
+    /// </summary>
+    public static void RunOnMainThread(Action work)
+    {
+        var ready = new ManualResetEventSlim(false);
+        _mainQueue.Enqueue(() => { work(); ready.Set(); });
+        ready.Wait();
+    }
+
+    /// <summary>
+    /// Dispatch work to Unity's main thread, block until it completes, and
+    /// return the result.
+    /// </summary>
+    public static T RunOnMainThread<T>(Func<T> work)
+    {
+        var ready  = new ManualResetEventSlim(false);
+        T   result = default;
+        _mainQueue.Enqueue(() => { result = work(); ready.Set(); });
+        ready.Wait();
+        return result;
+    }
+
+    /// <summary>Serialize a string to a JSON string literal, or "null".</summary>
+    public static string JsonStr(string s)
+    {
+        if (s == null) return "null";
+        return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"")
+                       .Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t") + "\"";
+    }
+
+    /// <summary>Write an HTTP response. Defaults to application/json.</summary>
+    public static void Respond(HttpListenerContext ctx, int status, string body, string contentType = "application/json")
+    {
+        var bytes = Encoding.UTF8.GetBytes(body);
+        ctx.Response.StatusCode      = status;
+        ctx.Response.ContentType     = contentType + "; charset=utf-8";
+        ctx.Response.ContentLength64 = bytes.Length;
+        ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
+        ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+        ctx.Response.Close();
     }
 
     // ---------------------------------------------------------------------------
@@ -524,25 +606,7 @@ public static class TestHttpServer
         return m.Success && m.Groups[1].Value.ToLowerInvariant() == "true";
     }
 
-    static string JsonStr(string s)
-    {
-        if (s == null) return "null";
-        return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"")
-                       .Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t") + "\"";
-    }
-
     static string BoolStr(bool v) => v ? "true" : "false";
-
-    static void Respond(HttpListenerContext ctx, int status, string body, string contentType = "application/json")
-    {
-        var bytes = Encoding.UTF8.GetBytes(body);
-        ctx.Response.StatusCode      = status;
-        ctx.Response.ContentType     = contentType + "; charset=utf-8";
-        ctx.Response.ContentLength64 = bytes.Length;
-        ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
-        ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
-        ctx.Response.Close();
-    }
 
     // ---------------------------------------------------------------------------
     // Inner types

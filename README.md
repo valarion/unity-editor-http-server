@@ -55,6 +55,64 @@ The server starts automatically when the Unity Editor opens (via `[InitializeOnL
 
 in the Unity console.
 
+## Local development
+
+To iterate on the package without pushing to git, point your Unity project at the local folder instead of the git URL. In `Packages/manifest.json`:
+
+```json
+{
+  "dependencies": {
+    "com.devtools.unity-editor-http-server": "file:G:/unity-editor-http-server"
+  }
+}
+```
+
+Edit `Editor/TestHttpServer.cs` directly — Unity recompiles automatically on save. When satisfied, push to git and switch the manifest entry back to the git URL.
+
+## Adding custom endpoints
+
+You can add endpoints from your own project without modifying the package. This is the recommended way to prototype new endpoints before contributing them upstream.
+
+**1. Create an Editor script in your project:**
+
+```csharp
+using UnityEditor;
+using System.Net;
+
+[InitializeOnLoad]
+public static class MyEndpoints
+{
+    static MyEndpoints()
+    {
+        TestHttpServer.RegisterEndpoint("GET", "/my/data", ctx =>
+        {
+            // Unity APIs must run on the main thread — use RunOnMainThread:
+            var value = TestHttpServer.RunOnMainThread(() => MyService.GetValue());
+            TestHttpServer.Respond(ctx, 200, $"{{\"value\":{TestHttpServer.JsonStr(value)}}}");
+        });
+    }
+}
+```
+
+**2. Test it:**
+```bash
+curl http://localhost:8765/my/data
+```
+
+**3. Contribute it upstream** by opening a PR to this repository.
+
+See `Samples~/CustomEndpoints/CustomEndpointExample.cs` for more examples including POST with a request body and main-thread dispatch.
+
+### Extension API reference
+
+| Member | Description |
+|--------|-------------|
+| `RegisterEndpoint(method, path, handler)` | Register a custom route. Built-in routes take precedence. |
+| `RunOnMainThread(Action)` | Dispatch work to Unity's main thread and block until done. |
+| `RunOnMainThread<T>(Func<T>)` | Same, but returns a value. |
+| `Respond(ctx, status, body, contentType?)` | Write an HTTP response. |
+| `JsonStr(string)` | Escape and quote a string as a JSON literal, or `"null"`. |
+
 ## Requirements
 
 - Unity 2021.3 or newer
