@@ -16,7 +16,14 @@ using UnityEngine;
 [InitializeOnLoad]
 public static class TestHttpServer
 {
-    const int Port = 8765;
+    // EditorPrefs keys
+    const string PrefPort      = "DevTools.HttpServer.Port";
+    const string PrefAutoStart = "DevTools.HttpServer.AutoStart";
+    public const int DefaultPort = 8765;
+
+    public static int  ConfiguredPort => EditorPrefs.GetInt(PrefPort, DefaultPort);
+    public static bool AutoStart      => EditorPrefs.GetBool(PrefAutoStart, true);
+    public static bool IsRunning      => _listener?.IsListening == true;
 
     static HttpListener _listener;
     static Thread _serverThread;
@@ -51,27 +58,41 @@ public static class TestHttpServer
     {
         EditorApplication.update += FlushMainQueue;
         EditorApplication.quitting += Shutdown;
+        // beforeAssemblyReload fires before every domain reload (recompile).
+        // This is the correct hook to release the socket — quitting does not.
+        AssemblyReloadEvents.beforeAssemblyReload += Shutdown;
         Application.logMessageReceived += OnLogMessage;
         CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
-        Startup();
+        if (AutoStart) Startup();
     }
 
-    static void Startup()
+    public static void Startup()
     {
+        Shutdown(); // release any socket left over from a previous domain
+        var port = ConfiguredPort;
         _listener = new HttpListener();
-        _listener.Prefixes.Add($"http://localhost:{Port}/");
+        _listener.Prefixes.Add($"http://localhost:{port}/");
         try { _listener.Start(); }
         catch (Exception ex)
         {
-            Debug.LogError($"[TestHttpServer] Failed to bind port {Port}: {ex.Message}");
+            Debug.LogError($"[TestHttpServer] Failed to bind port {port}: {ex.Message}");
             return;
         }
         _serverThread = new Thread(ServeLoop) { IsBackground = true, Name = "TestHttpServer" };
         _serverThread.Start();
-        Debug.Log($"[TestHttpServer] Listening on http://localhost:{Port}/  Swagger UI: http://localhost:{Port}/swagger");
+        Debug.Log($"[TestHttpServer] Listening on http://localhost:{port}/  Swagger UI: http://localhost:{port}/swagger");
     }
 
-    static void Shutdown() { try { _listener?.Stop(); } catch { } }
+    public static void Shutdown()
+    {
+        try { _listener?.Stop(); _listener = null; } catch { }
+    }
+
+    public static void SaveConfig(int port, bool autoStart)
+    {
+        EditorPrefs.SetInt(PrefPort, port);
+        EditorPrefs.SetBool(PrefAutoStart, autoStart);
+    }
 
     static void FlushMainQueue()
     {
@@ -912,4 +933,84 @@ public static class TestHttpServer
 </script>
 </body>
 </html>";
+}
+
+// =============================================================================
+// Settings window  —  Tools > HTTP Server > Settings
+// =============================================================================
+
+public class HttpServerSettingsWindow : EditorWindow
+{
+    int  _port;
+    bool _autoStart;
+    bool _dirty;
+
+    [MenuItem("Tools/HTTP Server/Settings")]
+    public static void Open() => GetWindow<HttpServerSettingsWindow>("HTTP Server").minSize = new UnityEngine.Vector2(320, 200);
+
+    void OnEnable()
+    {
+        _port      = TestHttpServer.ConfiguredPort;
+        _autoStart = TestHttpServer.AutoStart;
+        _dirty     = false;
+    }
+
+    void OnGUI()
+    {
+        EditorGUILayout.Space(8);
+
+        // Status
+        var statusStyle = new GUIStyle(EditorStyles.boldLabel);
+        statusStyle.normal.textColor = TestHttpServer.IsRunning
+            ? new UnityEngine.Color(0.2f, 0.8f, 0.2f)
+            : new UnityEngine.Color(0.8f, 0.3f, 0.3f);
+        EditorGUILayout.LabelField("Status", TestHttpServer.IsRunning
+            ? $"Running on port {TestHttpServer.ConfiguredPort}"
+            : "Stopped", statusStyle);
+
+        EditorGUILayout.Space(8);
+        EditorGUILayout.LabelField("Configuration", EditorStyles.boldLabel);
+        EditorGUI.BeginChangeCheck();
+
+        var newPort = EditorGUILayout.IntField("Port", _port);
+        if (newPort != _port) { _port = UnityEngine.Mathf.Clamp(newPort, 1024, 65535); _dirty = true; }
+
+        var newAuto = EditorGUILayout.Toggle("Auto-start on load", _autoStart);
+        if (newAuto != _autoStart) { _autoStart = newAuto; _dirty = true; }
+
+        EditorGUILayout.Space(12);
+        EditorGUILayout.BeginHorizontal();
+
+        GUI.enabled = _dirty;
+        if (GUILayout.Button("Apply & Restart"))
+        {
+            TestHttpServer.SaveConfig(_port, _autoStart);
+            _dirty = false;
+            if (_autoStart || TestHttpServer.IsRunning) TestHttpServer.Startup();
+            Repaint();
+        }
+        GUI.enabled = true;
+
+        if (TestHttpServer.IsRunning)
+        {
+            if (GUILayout.Button("Stop")) { TestHttpServer.Shutdown(); Repaint(); }
+        }
+        else
+        {
+            if (GUILayout.Button("Start")) { TestHttpServer.Startup(); Repaint(); }
+        }
+
+        EditorGUILayout.EndHorizontal();
+
+        if (_dirty)
+        {
+            EditorGUILayout.Space(4);
+            EditorGUILayout.HelpBox("Unsaved changes. Click Apply & Restart to use the new port.", MessageType.Info);
+        }
+
+        EditorGUILayout.Space(8);
+        EditorGUILayout.LabelField("Swagger UI", TestHttpServer.IsRunning
+            ? $"http://localhost:{TestHttpServer.ConfiguredPort}/swagger"
+            : "—", EditorStyles.miniLabel);
+    }
 }
