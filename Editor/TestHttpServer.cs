@@ -68,16 +68,28 @@ public static class TestHttpServer
 
     public static void Startup()
     {
-        Shutdown(); // release any socket left over from a previous domain
+        Shutdown();
         var port = ConfiguredPort;
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://localhost:{port}/");
-        try { _listener.Start(); }
-        catch (Exception ex)
+
+        // Retry a few times with a short delay: on Windows, HTTP.sys can take a
+        // moment to release a URL registration after Abort() even though the call
+        // returned successfully.
+        Exception lastEx = null;
+        for (int attempt = 0; attempt < 5; attempt++)
         {
-            Debug.LogError($"[TestHttpServer] Failed to bind port {port}: {ex.Message}");
+            if (attempt > 0) Thread.Sleep(50);
+            try { _listener.Start(); lastEx = null; break; }
+            catch (Exception ex) { lastEx = ex; }
+        }
+
+        if (lastEx != null)
+        {
+            Debug.LogError($"[TestHttpServer] Failed to bind port {port}: {lastEx.Message}");
             return;
         }
+
         _serverThread = new Thread(ServeLoop) { IsBackground = true, Name = "TestHttpServer" };
         _serverThread.Start();
         Debug.Log($"[TestHttpServer] Listening on http://localhost:{port}/  Swagger UI: http://localhost:{port}/swagger");
@@ -85,12 +97,12 @@ public static class TestHttpServer
 
     public static void Shutdown()
     {
-        // Close() releases the socket. Stop() only pauses accepting — the port stays bound.
-        try { _listener?.Close(); } catch { }
+        // Abort() is the forceful path — it immediately invalidates the listener
+        // and releases the HTTP.sys URL registration without waiting for in-flight
+        // requests to drain (unlike Close/Stop which can leave the port bound).
+        try { _listener?.Abort(); } catch { }
         _listener = null;
-        // Wait for the serve loop thread to exit before returning so Startup()
-        // can safely bind the same port again.
-        _serverThread?.Join(1000);
+        _serverThread?.Join(500);
         _serverThread = null;
     }
 
@@ -992,18 +1004,20 @@ public class HttpServerSettingsWindow : EditorWindow
         {
             TestHttpServer.SaveConfig(_port, _autoStart);
             _dirty = false;
-            if (_autoStart || TestHttpServer.IsRunning) TestHttpServer.Startup();
-            Repaint();
+            // Defer out of OnGUI — socket operations must not block the GUI event loop.
+            EditorApplication.delayCall += () => { TestHttpServer.Startup(); Repaint(); };
         }
         GUI.enabled = true;
 
         if (TestHttpServer.IsRunning)
         {
-            if (GUILayout.Button("Stop")) { TestHttpServer.Shutdown(); Repaint(); }
+            if (GUILayout.Button("Stop"))
+                EditorApplication.delayCall += () => { TestHttpServer.Shutdown(); Repaint(); };
         }
         else
         {
-            if (GUILayout.Button("Start")) { TestHttpServer.Startup(); Repaint(); }
+            if (GUILayout.Button("Start"))
+                EditorApplication.delayCall += () => { TestHttpServer.Startup(); Repaint(); };
         }
 
         EditorGUILayout.EndHorizontal();
