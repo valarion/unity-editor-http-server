@@ -23,10 +23,11 @@ public static class TestHttpServer
 
     public static int  ConfiguredPort => EditorPrefs.GetInt(PrefPort, DefaultPort);
     public static bool AutoStart      => EditorPrefs.GetBool(PrefAutoStart, true);
-    public static bool IsRunning      => _listener?.IsListening == true;
+    public static bool IsRunning      => _listener?.IsListening == true && !_paused;
 
-    static HttpListener _listener;
-    static Thread _serverThread;
+    static HttpListener      _listener;
+    static Thread            _serverThread;
+    static volatile bool     _paused;          // true = accept but return 503, thread keeps running
     static readonly ConcurrentQueue<Action> _mainQueue = new ConcurrentQueue<Action>();
 
     // Rolling log buffer — populated by Application.logMessageReceived
@@ -66,11 +67,12 @@ public static class TestHttpServer
         if (AutoStart) Startup();
     }
 
-    // Full init: always tears down any existing listener and creates a fresh one.
-    // Use this on first start, port change, or domain reload recovery.
+    // Full init: tears down any existing listener and creates a fresh one.
+    // Use on first start, port change, or after domain reload.
     public static void Startup()
     {
         Shutdown();
+        _paused = false;
         var port = ConfiguredPort;
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://localhost:{port}/");
@@ -81,47 +83,38 @@ public static class TestHttpServer
             _listener = null;
             return;
         }
-        StartServeThread();
+        _serverThread = new Thread(ServeLoop) { IsBackground = true, Name = "TestHttpServer" };
+        _serverThread.Start();
         Debug.Log($"[TestHttpServer] Listening on http://localhost:{port}/  Swagger UI: http://localhost:{port}/swagger");
     }
 
-    // Pause: stop accepting requests but keep the socket reserved.
-    // The same listener can be resumed with Resume() without releasing the port.
+    // Pause: the serve thread keeps running but returns 503 for every request.
+    // The socket stays bound so Resume() never needs to rebind the port.
+    // (In Mono/Unity, HttpListener.Stop() releases the socket just like Abort(),
+    // so we can't use Stop/Start for pause/resume — the flag approach is the only
+    // safe option.)
     public static void Pause()
     {
-        try { _listener?.Stop(); } catch { }
-        _serverThread?.Join(500);
-        _serverThread = null;
+        _paused = true;
+        Debug.Log("[TestHttpServer] Paused (socket still bound, returning 503).");
     }
 
-    // Resume a paused listener. The socket was never released so rebinding is not needed.
+    // Resume a paused server. No socket operation needed.
     public static void Resume()
     {
-        if (_listener == null) { Startup(); return; }
-        try { _listener.Start(); }
-        catch (Exception ex)
-        {
-            Debug.LogError($"[TestHttpServer] Failed to resume on port {ConfiguredPort}: {ex.Message}");
-            return;
-        }
-        StartServeThread();
+        if (_listener == null || !_listener.IsListening) { Startup(); return; }
+        _paused = false;
         Debug.Log($"[TestHttpServer] Resumed on http://localhost:{ConfiguredPort}/");
     }
 
-    // Full teardown: releases the socket entirely.
-    // Call before domain reload, on quit, or before a port change.
+    // Full teardown: releases the socket. Call before domain reload, quit, or port change.
     public static void Shutdown()
     {
+        _paused = false;
         try { _listener?.Abort(); } catch { }
         _listener = null;
         _serverThread?.Join(500);
         _serverThread = null;
-    }
-
-    static void StartServeThread()
-    {
-        _serverThread = new Thread(ServeLoop) { IsBackground = true, Name = "TestHttpServer" };
-        _serverThread.Start();
     }
 
     public static void SaveConfig(int port, bool autoStart)
@@ -169,7 +162,13 @@ public static class TestHttpServer
             HttpListenerContext ctx;
             try { ctx = _listener.GetContext(); }
             catch { break; }
-            ThreadPool.QueueUserWorkItem(_ => Route(ctx));
+            if (_paused)
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try { Respond(ctx, 503, "{\"error\":\"server paused\"}"); } catch { }
+                });
+            else
+                ThreadPool.QueueUserWorkItem(_ => Route(ctx));
         }
     }
 
