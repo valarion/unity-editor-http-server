@@ -77,7 +77,6 @@ You can add endpoints from your own project without modifying the package. This 
 
 ```csharp
 using UnityEditor;
-using System.Net;
 
 [InitializeOnLoad]
 public static class MyEndpoints
@@ -127,7 +126,7 @@ The `skills/` directory contains ready-made integration files:
 
 ## Port
 
-The server binds to port `8765`. If that port is in use, an error is logged to the Unity console and the server stays inactive. The port is defined as `const int Port = 8765` in `Editor/TestHttpServer.cs`.
+The default port is `8765`. You can change it (and toggle auto-start) in **Tools > HTTP Server > Settings**. The port is persisted in `EditorPrefs` and survives recompiles. If the port is unavailable the server logs an error and stays inactive.
 
 ## Notes
 

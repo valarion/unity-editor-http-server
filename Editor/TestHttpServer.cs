@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -23,11 +24,11 @@ public static class TestHttpServer
 
     public static int  ConfiguredPort => EditorPrefs.GetInt(PrefPort, DefaultPort);
     public static bool AutoStart      => EditorPrefs.GetBool(PrefAutoStart, true);
-    public static bool IsRunning      => _listener?.IsListening == true && !_paused;
+    public static bool IsRunning      => _serverSocket != null && !_paused;
 
-    static HttpListener      _listener;
+    static Socket            _serverSocket;
     static Thread            _serverThread;
-    static volatile bool     _paused;          // true = accept but return 503, thread keeps running
+    static volatile bool     _paused;          // true = accept connections but return 503, socket stays open
     static readonly ConcurrentQueue<Action> _mainQueue = new ConcurrentQueue<Action>();
 
     // Rolling log buffer — populated by Application.logMessageReceived
@@ -39,8 +40,8 @@ public static class TestHttpServer
         new ConcurrentDictionary<string, CompilerMessage[]>(StringComparer.OrdinalIgnoreCase);
 
     // Custom endpoints registered by other assemblies via RegisterEndpoint()
-    static readonly Dictionary<(string method, string path), Action<HttpListenerContext>> _customRoutes =
-        new Dictionary<(string, string), Action<HttpListenerContext>>();
+    static readonly Dictionary<(string method, string path), Action<ServerHttpContext>> _customRoutes =
+        new Dictionary<(string, string), Action<ServerHttpContext>>();
 
     // Asset type aliases for /assets/list?type=X
     static readonly Dictionary<string, string> _typeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -67,20 +68,26 @@ public static class TestHttpServer
         if (AutoStart) Startup();
     }
 
-    // Full init: tears down any existing listener and creates a fresh one.
-    // Use on first start, port change, or after domain reload.
+    // Full init: tears down any existing socket and creates a fresh one with SO_REUSEADDR.
+    // SO_REUSEADDR lets us rebind the same port immediately even if prior connections are
+    // still in TCP TIME_WAIT — this is what makes port changes (including reverts) reliable.
     public static void Startup()
     {
         Shutdown();
         _paused = false;
         var port = ConfiguredPort;
-        _listener = new HttpListener();
-        _listener.Prefixes.Add($"http://localhost:{port}/");
-        try { _listener.Start(); }
+        try
+        {
+            _serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            _serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            _serverSocket.Bind(new IPEndPoint(IPAddress.Loopback, port));
+            _serverSocket.Listen(32);
+        }
         catch (Exception ex)
         {
             Debug.LogError($"[TestHttpServer] Failed to bind port {port}: {ex.Message}");
-            _listener = null;
+            try { _serverSocket?.Close(); } catch { }
+            _serverSocket = null;
             return;
         }
         _serverThread = new Thread(ServeLoop) { IsBackground = true, Name = "TestHttpServer" };
@@ -88,31 +95,28 @@ public static class TestHttpServer
         Debug.Log($"[TestHttpServer] Listening on http://localhost:{port}/  Swagger UI: http://localhost:{port}/swagger");
     }
 
-    // Pause: the serve thread keeps running but returns 503 for every request.
-    // The socket stays bound so Resume() never needs to rebind the port.
-    // (In Mono/Unity, HttpListener.Stop() releases the socket just like Abort(),
-    // so we can't use Stop/Start for pause/resume — the flag approach is the only
-    // safe option.)
+    // Pause: the socket stays open; every accepted connection gets a 503.
     public static void Pause()
     {
         _paused = true;
         Debug.Log("[TestHttpServer] Paused (socket still bound, returning 503).");
     }
 
-    // Resume a paused server. No socket operation needed.
+    // Resume a paused server. If the socket is gone, falls back to a full Startup().
     public static void Resume()
     {
-        if (_listener == null || !_listener.IsListening) { Startup(); return; }
+        if (_serverSocket == null) { Startup(); return; }
         _paused = false;
         Debug.Log($"[TestHttpServer] Resumed on http://localhost:{ConfiguredPort}/");
     }
 
-    // Full teardown: releases the socket. Call before domain reload, quit, or port change.
+    // Full teardown: closes the socket. SO_REUSEADDR on the next Startup() means the
+    // same port (or a reverted port) can be rebound immediately regardless of TIME_WAIT.
     public static void Shutdown()
     {
         _paused = false;
-        try { _listener?.Abort(); } catch { }
-        _listener = null;
+        try { _serverSocket?.Close(); } catch { }
+        _serverSocket = null;
         _serverThread?.Join(500);
         _serverThread = null;
     }
@@ -157,29 +161,111 @@ public static class TestHttpServer
 
     static void ServeLoop()
     {
-        while (_listener.IsListening)
+        while (_serverSocket != null)
         {
-            HttpListenerContext ctx;
-            try { ctx = _listener.GetContext(); }
+            Socket client;
+            try { client = _serverSocket.Accept(); }
             catch { break; }
-            if (_paused)
-                ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    try { Respond(ctx, 503, "{\"error\":\"server paused\"}"); } catch { }
-                });
-            else
-                ThreadPool.QueueUserWorkItem(_ => Route(ctx));
+            var captured = client;
+            ThreadPool.QueueUserWorkItem(_ => HandleClient(captured));
         }
+    }
+
+    static void HandleClient(Socket client)
+    {
+        try
+        {
+            using var ns = new NetworkStream(client, ownsSocket: true);
+
+            // Read until the blank line that ends HTTP headers (\r\n\r\n).
+            var headerBuf = new List<byte>(512);
+            int b;
+            while ((b = ns.ReadByte()) >= 0)
+            {
+                headerBuf.Add((byte)b);
+                int n = headerBuf.Count;
+                if (n >= 4 &&
+                    headerBuf[n - 4] == '\r' && headerBuf[n - 3] == '\n' &&
+                    headerBuf[n - 2] == '\r' && headerBuf[n - 1] == '\n')
+                    break;
+                if (n > 8192) return;   // header too large — drop
+            }
+            if (b < 0) return;
+
+            var lines = Encoding.ASCII.GetString(headerBuf.ToArray())
+                .Split(new[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+            if (lines.Length == 0) return;
+
+            var parts = lines[0].Split(' ');
+            if (parts.Length < 2) return;
+            var method = parts[0].ToUpperInvariant();
+            var rawUrl  = parts[1];
+
+            var hdrMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 1; i < lines.Length; i++)
+            {
+                var colon = lines[i].IndexOf(':');
+                if (colon > 0)
+                    hdrMap[lines[i].Substring(0, colon).Trim()] = lines[i].Substring(colon + 1).Trim();
+            }
+
+            // Parse URL + query string.
+            Uri uri;
+            try { uri = new Uri("http://localhost" + rawUrl); }
+            catch { return; }
+
+            var qs = new System.Collections.Specialized.NameValueCollection();
+            if (!string.IsNullOrEmpty(uri.Query))
+            {
+                foreach (var param in uri.Query.TrimStart('?').Split('&'))
+                {
+                    if (string.IsNullOrEmpty(param)) continue;
+                    var eq = param.IndexOf('=');
+                    if (eq > 0)
+                        qs[Uri.UnescapeDataString(param.Substring(0, eq))] =
+                            Uri.UnescapeDataString(param.Substring(eq + 1));
+                    else
+                        qs[Uri.UnescapeDataString(param)] = "";
+                }
+            }
+
+            // Read body (if Content-Length is present).
+            Stream bodyStream = Stream.Null;
+            if (hdrMap.TryGetValue("Content-Length", out var clStr) &&
+                int.TryParse(clStr, out var cl) && cl > 0)
+            {
+                var buf = new byte[cl];
+                int read = 0;
+                while (read < cl) { int r = ns.Read(buf, read, cl - read); if (r <= 0) break; read += r; }
+                bodyStream = new MemoryStream(buf, 0, read, writable: false);
+            }
+
+            var ctx = new ServerHttpContext
+            {
+                Request = new ServerHttpRequest
+                {
+                    Method       = method,
+                    AbsolutePath = uri.AbsolutePath,
+                    QueryString  = qs,
+                    InputStream  = bodyStream,
+                },
+                Response = new ServerHttpResponse(ns),
+            };
+
+            if (_paused) Respond(ctx, 503, "{\"error\":\"server paused\"}");
+            else         Route(ctx);
+        }
+        catch { }
     }
 
     // ---------------------------------------------------------------------------
     // Routing
     // ---------------------------------------------------------------------------
 
-    static void Route(HttpListenerContext ctx)
+    static void Route(ServerHttpContext ctx)
     {
-        var path   = ctx.Request.Url.AbsolutePath.TrimEnd('/').ToLowerInvariant();
-        var method = ctx.Request.HttpMethod.ToUpperInvariant();
+        var path   = ctx.Request.AbsolutePath.TrimEnd('/').ToLowerInvariant();
+        var method = ctx.Request.Method;
         try
         {
             if      (path == "/tests/list"             && method == "GET")  HandleList(ctx);
@@ -193,7 +279,7 @@ public static class TestHttpServer
             else if ((path == "/swagger" || path == "/swagger/index.html") && method == "GET") HandleSwaggerUi(ctx);
             else
             {
-                Action<HttpListenerContext> custom;
+                Action<ServerHttpContext> custom;
                 lock (_customRoutes) _customRoutes.TryGetValue((method, path), out custom);
                 if (custom != null) custom(ctx);
                 else Respond(ctx, 404, "{\"error\":\"not found\"}");
@@ -228,7 +314,7 @@ public static class TestHttpServer
     ///     }
     /// }
     /// </example>
-    public static void RegisterEndpoint(string method, string path, Action<HttpListenerContext> handler)
+    public static void RegisterEndpoint(string method, string path, Action<ServerHttpContext> handler)
     {
         var key = (method.ToUpperInvariant(), path.ToLowerInvariant().TrimEnd('/'));
         lock (_customRoutes) _customRoutes[key] = handler;
@@ -267,12 +353,11 @@ public static class TestHttpServer
     }
 
     /// <summary>Write an HTTP response. Defaults to application/json.</summary>
-    public static void Respond(HttpListenerContext ctx, int status, string body, string contentType = "application/json")
+    public static void Respond(ServerHttpContext ctx, int status, string body, string contentType = "application/json")
     {
         var bytes = Encoding.UTF8.GetBytes(body);
-        ctx.Response.StatusCode      = status;
-        ctx.Response.ContentType     = contentType + "; charset=utf-8";
-        ctx.Response.ContentLength64 = bytes.Length;
+        ctx.Response.StatusCode  = status;
+        ctx.Response.ContentType = contentType;
         ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
         ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
         ctx.Response.Close();
@@ -282,7 +367,7 @@ public static class TestHttpServer
     // GET /tests/list  →  ["Full.Test.Name", ...]
     // ---------------------------------------------------------------------------
 
-    static void HandleList(HttpListenerContext ctx)
+    static void HandleList(ServerHttpContext ctx)
     {
         var ready = new ManualResetEventSlim(false);
         var json  = "";
@@ -317,7 +402,7 @@ public static class TestHttpServer
     // Minimal response: {"total":10,"passed":9,"failed":1,"errors":[{"name":"...","message":"...","stackTrace":"..."}]}
     // ---------------------------------------------------------------------------
 
-    static void HandleRun(HttpListenerContext ctx)
+    static void HandleRun(ServerHttpContext ctx)
     {
         string[] patterns = null;
         bool     minimal  = false;
@@ -389,7 +474,7 @@ public static class TestHttpServer
     // is false, then check compilerMessages for errors before running tests.
     // ---------------------------------------------------------------------------
 
-    static void HandleEditorStatus(HttpListenerContext ctx)
+    static void HandleEditorStatus(ServerHttpContext ctx)
     {
         var ready = new ManualResetEventSlim(false);
         var json  = "";
@@ -446,7 +531,7 @@ public static class TestHttpServer
     // No main-thread dispatch needed — ConcurrentQueue.ToArray() is thread-safe.
     // ---------------------------------------------------------------------------
 
-    static void HandleLogsGet(HttpListenerContext ctx)
+    static void HandleLogsGet(ServerHttpContext ctx)
     {
         var query       = ctx.Request.QueryString;
         var levelFilter = (query["level"] ?? "all").ToLowerInvariant();
@@ -479,7 +564,7 @@ public static class TestHttpServer
     // POST /logs/clear  →  { "cleared": N }
     // ---------------------------------------------------------------------------
 
-    static void HandleLogsClear(HttpListenerContext ctx)
+    static void HandleLogsClear(ServerHttpContext ctx)
     {
         int count = 0;
         while (_logBuffer.TryDequeue(out _)) count++;
@@ -490,7 +575,7 @@ public static class TestHttpServer
     // POST /assets/refresh  →  { "refreshed": true, "wasCompiling": false }
     // ---------------------------------------------------------------------------
 
-    static void HandleAssetsRefresh(HttpListenerContext ctx)
+    static void HandleAssetsRefresh(ServerHttpContext ctx)
     {
         var ready        = new ManualResetEventSlim(false);
         bool wasCompiling = false;
@@ -512,7 +597,7 @@ public static class TestHttpServer
     // Returns { "count": N, "assets": [{ "guid": "...", "path": "..." }] }
     // ---------------------------------------------------------------------------
 
-    static void HandleAssetsList(HttpListenerContext ctx)
+    static void HandleAssetsList(ServerHttpContext ctx)
     {
         var query     = ctx.Request.QueryString;
         var typeParam = query["type"];
@@ -546,8 +631,8 @@ public static class TestHttpServer
     // GET /swagger/openapi.json  and  GET /swagger
     // ---------------------------------------------------------------------------
 
-    static void HandleOpenApiSpec(HttpListenerContext ctx) => Respond(ctx, 200, OpenApiSpec, "application/json");
-    static void HandleSwaggerUi(HttpListenerContext ctx)   => Respond(ctx, 200, SwaggerUiHtml, "text/html");
+    static void HandleOpenApiSpec(ServerHttpContext ctx) => Respond(ctx, 200, OpenApiSpec, "application/json");
+    static void HandleSwaggerUi(ServerHttpContext ctx)   => Respond(ctx, 200, SwaggerUiHtml, "text/html");
 
     // ---------------------------------------------------------------------------
     // Test discovery helper (used for wildcard expansion in /tests/run)
@@ -1061,4 +1146,67 @@ public class HttpServerSettingsWindow : EditorWindow
             running ? $"http://localhost:{TestHttpServer.ConfiguredPort}/swagger" : "—",
             EditorStyles.miniLabel);
     }
+}
+
+// =============================================================================
+// HTTP context types — used by built-in handlers and the RegisterEndpoint() API
+// =============================================================================
+
+public class ServerHttpRequest
+{
+    public string Method       { get; internal set; }
+    public string AbsolutePath { get; internal set; }
+    public System.Collections.Specialized.NameValueCollection QueryString { get; internal set; }
+        = new System.Collections.Specialized.NameValueCollection();
+    public Stream InputStream  { get; internal set; } = Stream.Null;
+}
+
+public class ServerHttpResponse
+{
+    readonly NetworkStream _stream;
+    readonly MemoryStream  _body   = new MemoryStream();
+    bool _closed;
+
+    internal ServerHttpResponse(NetworkStream stream) => _stream = stream;
+
+    public int    StatusCode      { get; set; } = 200;
+    public string ContentType     { get; set; } = "application/json";
+    public long   ContentLength64 { get; set; }  // ignored — computed from body at Close()
+    public Dictionary<string, string> Headers { get; } = new Dictionary<string, string>();
+    public Stream OutputStream => _body;
+
+    public void Close()
+    {
+        if (_closed) return;
+        _closed = true;
+        try
+        {
+            var body = _body.ToArray();
+            var statusText = StatusCode switch
+            {
+                200 => "OK",  201 => "Created",  400 => "Bad Request",
+                404 => "Not Found",  500 => "Internal Server Error",
+                503 => "Service Unavailable",  _   => "Unknown"
+            };
+            var sb = new StringBuilder();
+            sb.Append($"HTTP/1.1 {StatusCode} {statusText}\r\n");
+            sb.Append($"Content-Type: {ContentType}; charset=utf-8\r\n");
+            sb.Append($"Content-Length: {body.Length}\r\n");
+            foreach (var kv in Headers)
+                sb.Append($"{kv.Key}: {kv.Value}\r\n");
+            sb.Append("Connection: close\r\n\r\n");
+            var headerBytes = Encoding.ASCII.GetBytes(sb.ToString());
+            _stream.Write(headerBytes, 0, headerBytes.Length);
+            _stream.Write(body, 0, body.Length);
+            _stream.Flush();
+        }
+        catch { }
+        finally { try { _stream.Close(); } catch { } }
+    }
+}
+
+public class ServerHttpContext
+{
+    public ServerHttpRequest  Request  { get; internal set; }
+    public ServerHttpResponse Response { get; internal set; }
 }
