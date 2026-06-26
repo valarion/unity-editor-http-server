@@ -631,7 +631,9 @@ public static class TestHttpServer
     // GET /swagger/openapi.json  and  GET /swagger
     // ---------------------------------------------------------------------------
 
-    static void HandleOpenApiSpec(ServerHttpContext ctx) => Respond(ctx, 200, OpenApiSpec, "application/json");
+    static void HandleOpenApiSpec(ServerHttpContext ctx) =>
+        Respond(ctx, 200, OpenApiSpec.Replace("\"http://localhost:8765\"",
+            $"\"http://localhost:{ConfiguredPort}\""), "application/json");
     static void HandleSwaggerUi(ServerHttpContext ctx)   => Respond(ctx, 200, SwaggerUiHtml, "text/html");
 
     // ---------------------------------------------------------------------------
