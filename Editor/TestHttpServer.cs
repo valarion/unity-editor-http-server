@@ -1212,3 +1212,22 @@ public class ServerHttpContext
     public ServerHttpRequest  Request  { get; internal set; }
     public ServerHttpResponse Response { get; internal set; }
 }
+
+// =============================================================================
+// Console double-click handler
+// When the server is running, double-clicking any TestHttpServer log entry
+// opens the Swagger UI in the browser instead of opening the script in the editor.
+// =============================================================================
+
+public class HttpServerConsoleLink
+{
+    [UnityEditor.Callbacks.OnOpenAsset]
+    static bool OnOpenAsset(int instanceID, int line)
+    {
+        if (!TestHttpServer.IsRunning) return false;
+        var path = AssetDatabase.GetAssetPath(instanceID);
+        if (!path.EndsWith("TestHttpServer.cs", StringComparison.OrdinalIgnoreCase)) return false;
+        Application.OpenURL($"http://localhost:{TestHttpServer.ConfiguredPort}/swagger");
+        return true;   // consumed — skip opening the script editor
+    }
+}
