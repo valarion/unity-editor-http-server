@@ -1225,22 +1225,22 @@ public class HttpServerConsoleLink
 {
     // Cached instanceID of TestHttpServer.cs — resolved lazily on first double-click
     // using only non-deprecated AssetDatabase APIs (FindAssets + LoadAssetAtPath).
-    static int _scriptInstanceId;
+    static EntityId _scriptInstanceId;
 
-    static int ScriptInstanceId()
+    static EntityId ScriptInstanceId()
     {
-        if (_scriptInstanceId != 0) return _scriptInstanceId;
+        if (_scriptInstanceId != EntityId.None) return _scriptInstanceId;
         foreach (var guid in AssetDatabase.FindAssets("TestHttpServer t:MonoScript"))
         {
             var script = AssetDatabase.LoadAssetAtPath<MonoScript>(
                 AssetDatabase.GUIDToAssetPath(guid));
-            if (script != null) { _scriptInstanceId = script.GetInstanceID(); break; }
+            if (script != null) { _scriptInstanceId = script.GetEntityId(); break; }
         }
         return _scriptInstanceId;
     }
 
     [UnityEditor.Callbacks.OnOpenAsset]
-    static bool OnOpenAsset(int instanceID, int line)
+    static bool OnOpenAsset(EntityId instanceID, int line)
     {
         if (!TestHttpServer.IsRunning) return false;
         if (instanceID != ScriptInstanceId()) return false;
