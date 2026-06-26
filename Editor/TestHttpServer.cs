@@ -1223,14 +1223,27 @@ public class ServerHttpContext
 
 public class HttpServerConsoleLink
 {
+    // Cached instanceID of TestHttpServer.cs — resolved lazily on first double-click
+    // using only non-deprecated AssetDatabase APIs (FindAssets + LoadAssetAtPath).
+    static int _scriptInstanceId;
+
+    static int ScriptInstanceId()
+    {
+        if (_scriptInstanceId != 0) return _scriptInstanceId;
+        foreach (var guid in AssetDatabase.FindAssets("TestHttpServer t:MonoScript"))
+        {
+            var script = AssetDatabase.LoadAssetAtPath<MonoScript>(
+                AssetDatabase.GUIDToAssetPath(guid));
+            if (script != null) { _scriptInstanceId = script.GetInstanceID(); break; }
+        }
+        return _scriptInstanceId;
+    }
+
     [UnityEditor.Callbacks.OnOpenAsset]
     static bool OnOpenAsset(int instanceID, int line)
     {
         if (!TestHttpServer.IsRunning) return false;
-        var obj = EditorUtility.InstanceIDToObject(instanceID);
-        if (obj == null) return false;
-        var path = AssetDatabase.GetAssetPath(obj);
-        if (!path.EndsWith("TestHttpServer.cs", StringComparison.OrdinalIgnoreCase)) return false;
+        if (instanceID != ScriptInstanceId()) return false;
         Application.OpenURL($"http://localhost:{TestHttpServer.ConfiguredPort}/swagger");
         return true;   // consumed — skip opening the script editor
     }
