@@ -29,6 +29,7 @@ public static class TestHttpServer
     static Socket            _serverSocket;
     static Thread            _serverThread;
     static volatile bool     _paused;          // true = accept connections but return 503, socket stays open
+    static int               _activePort;      // port actually bound; set on main thread in Startup()
     static readonly ConcurrentQueue<Action> _mainQueue = new ConcurrentQueue<Action>();
 
     // Rolling log buffer — populated by Application.logMessageReceived
@@ -75,7 +76,8 @@ public static class TestHttpServer
     {
         Shutdown();
         _paused = false;
-        var port = ConfiguredPort;
+        var port = ConfiguredPort;   // EditorPrefs — must be read on main thread (here in Startup)
+        _activePort = port;
         try
         {
             _serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
@@ -633,7 +635,7 @@ public static class TestHttpServer
 
     static void HandleOpenApiSpec(ServerHttpContext ctx) =>
         Respond(ctx, 200, OpenApiSpec.Replace("\"http://localhost:8765\"",
-            $"\"http://localhost:{ConfiguredPort}\""), "application/json");
+            $"\"http://localhost:{_activePort}\""), "application/json");
     static void HandleSwaggerUi(ServerHttpContext ctx)   => Respond(ctx, 200, SwaggerUiHtml, "text/html");
 
     // ---------------------------------------------------------------------------
