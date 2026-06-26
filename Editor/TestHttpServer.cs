@@ -277,6 +277,8 @@ public static class TestHttpServer
             else if (path == "/logs/clear"             && method == "POST") HandleLogsClear(ctx);
             else if (path == "/assets/refresh"         && method == "POST") HandleAssetsRefresh(ctx);
             else if (path == "/assets/list"            && method == "GET")  HandleAssetsList(ctx);
+            else if (path == "/editor/selection"       && method == "GET")  HandleEditorSelection(ctx);
+            else if (path == "/editor/screenshot"      && method == "GET")  HandleScreenshot(ctx);
             else if (path == "/swagger/openapi.json"   && method == "GET")  HandleOpenApiSpec(ctx);
             else if ((path == "/swagger" || path == "/swagger/index.html") && method == "GET") HandleSwaggerUi(ctx);
             else
@@ -362,6 +364,16 @@ public static class TestHttpServer
         ctx.Response.ContentType = contentType;
         ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
         ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
+        ctx.Response.Close();
+    }
+
+    /// <summary>Write a raw binary HTTP response (e.g. image/png).</summary>
+    public static void RespondBytes(ServerHttpContext ctx, int status, byte[] body, string contentType)
+    {
+        ctx.Response.StatusCode  = status;
+        ctx.Response.ContentType = contentType;
+        ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
+        ctx.Response.OutputStream.Write(body, 0, body.Length);
         ctx.Response.Close();
     }
 
@@ -594,6 +606,120 @@ public static class TestHttpServer
     }
 
     // ---------------------------------------------------------------------------
+    // GET /editor/screenshot?superSize=1
+    //
+    // Captures the Game view as a PNG and returns the raw image bytes
+    // (Content-Type: image/png).  Use superSize=2/4 for higher-resolution captures.
+    //
+    // The Game view must be open and have rendered at least one frame; if it has
+    // not, Unity returns null and the endpoint responds with 503.
+    //
+    // Use cases: verify UI layout, check for visual artifacts, confirm render state.
+    // ---------------------------------------------------------------------------
+
+    static void HandleScreenshot(ServerHttpContext ctx)
+    {
+        int superSize = 1;
+        if (int.TryParse(ctx.Request.QueryString["superSize"], out var ss) && ss >= 1 && ss <= 8)
+            superSize = ss;
+
+        var ready    = new ManualResetEventSlim(false);
+        byte[] png   = null;
+        string error = null;
+
+        // Enqueue to main thread only to register the delayCall — the actual capture
+        // must NOT run during EditorApplication.update (FlushMainQueue) because that
+        // fires mid-frame while URP render passes are active, causing attachment
+        // dimension-mismatch errors. delayCall fires on the NEXT editor tick, after the
+        // current frame's rendering has fully completed.
+        _mainQueue.Enqueue(() =>
+        {
+            EditorApplication.delayCall += () =>
+            {
+                try
+                {
+                    var tex = ScreenCapture.CaptureScreenshotAsTexture(superSize);
+                    if (tex != null)
+                    {
+                        png = tex.EncodeToPNG();
+                        UnityEngine.Object.DestroyImmediate(tex);
+                    }
+                    else
+                    {
+                        error = "{\"error\":\"capture returned null — open the Game view and ensure at least one frame has rendered\"}";
+                    }
+                }
+                catch (Exception ex)
+                {
+                    error = $"{{\"error\":{JsonStr(ex.Message)}}}";
+                }
+                ready.Set();
+            };
+        });
+
+        ready.Wait();
+
+        if (error != null) Respond(ctx, 503, error);
+        else               RespondBytes(ctx, 200, png, "image/png");
+    }
+
+    // GET /editor/selection
+    //
+    // Returns the currently selected objects in the Unity Editor.
+    // Uses Selection.entityIds (Unity 6.5+) to enumerate all selected objects.
+    //
+    // Response:
+    // {
+    //   "count": 2,
+    //   "activeObject": { "name": "MyScript", "type": "MonoScript", "assetPath": "Assets/Scripts/MyScript.cs" },
+    //   "objects": [
+    //     { "name": "MyScript", "type": "MonoScript", "assetPath": "Assets/Scripts/MyScript.cs" },
+    //     { "name": "Player",   "type": "GameObject", "assetPath": null }
+    //   ]
+    // }
+    // assetPath is null for scene objects (not assets on disk).
+    // ---------------------------------------------------------------------------
+
+    static void HandleEditorSelection(ServerHttpContext ctx)
+    {
+        var ready = new ManualResetEventSlim(false);
+        var json  = "";
+
+        _mainQueue.Enqueue(() =>
+        {
+            var ids       = Selection.entityIds;            // EntityId[] — Unity 6.5+
+            var activeId  = Selection.activeEntityId;       // EntityId   — Unity 6.5+
+
+            string SerializeObject(EntityId id)
+            {
+                var obj = EditorUtility.EntityIdToObject(id);
+                if (obj == null) return null;
+                var assetPath = AssetDatabase.GetAssetPath(id);
+                return $"{{\"name\":{JsonStr(obj.name)},\"type\":{JsonStr(obj.GetType().Name)}," +
+                       $"\"assetPath\":{JsonStr(string.IsNullOrEmpty(assetPath) ? null : assetPath)}}}";
+            }
+
+            var activeJson = activeId.IsValid() ? SerializeObject(activeId) : "null";
+
+            var sb = new StringBuilder($"{{\"count\":{ids.Length},\"activeObject\":{activeJson},\"objects\":[");
+            bool first = true;
+            foreach (var id in ids)
+            {
+                var entry = SerializeObject(id);
+                if (entry == null) continue;
+                if (!first) sb.Append(',');
+                sb.Append(entry);
+                first = false;
+            }
+            sb.Append("]}");
+            json = sb.ToString();
+            ready.Set();
+        });
+
+        ready.Wait();
+        Respond(ctx, 200, json);
+    }
+
     // GET /assets/list?type=Script|Prefab|ScriptableObject|Scene|Texture|...
     //
     // Returns { "count": N, "assets": [{ "guid": "...", "path": "..." }] }
@@ -867,6 +993,41 @@ public static class TestHttpServer
         }
       }
     },
+    ""/editor/screenshot"": {
+      ""get"": {
+        ""summary"": ""Capture the Game view as PNG"",
+        ""description"": ""Returns a raw PNG screenshot of the Unity Game view. The Game view must be open and have rendered at least one frame. Use superSize for higher-resolution captures (2× or 4× the display resolution)."",
+        ""parameters"": [
+          {
+            ""name"": ""superSize"", ""in"": ""query"",
+            ""description"": ""Resolution multiplier (1–8). Default 1. 2 doubles width and height."",
+            ""schema"": { ""type"": ""integer"", ""default"": 1, ""minimum"": 1, ""maximum"": 8 }
+          }
+        ],
+        ""responses"": {
+          ""200"": {
+            ""description"": ""PNG image bytes"",
+            ""content"": { ""image/png"": { ""schema"": { ""type"": ""string"", ""format"": ""binary"" } } }
+          },
+          ""503"": {
+            ""description"": ""Game view not available or no frame rendered yet"",
+            ""content"": { ""application/json"": { ""schema"": { ""$ref"": ""#/components/schemas/ErrorResponse"" } } }
+          }
+        }
+      }
+    },
+    ""/editor/selection"": {
+      ""get"": {
+        ""summary"": ""Get current Editor selection"",
+        ""description"": ""Returns the objects currently selected in the Unity Editor using the Unity 6.5 EntityId API. assetPath is null for scene objects."",
+        ""responses"": {
+          ""200"": {
+            ""description"": ""Selected objects"",
+            ""content"": { ""application/json"": { ""schema"": { ""$ref"": ""#/components/schemas/SelectionResponse"" } } }
+          }
+        }
+      }
+    },
     ""/tests/list"": {
       ""get"": {
         ""summary"": ""List all edit-mode tests"",
@@ -984,6 +1145,26 @@ public static class TestHttpServer
         ""properties"": {
           ""guid"": { ""type"": ""string"" },
           ""path"": { ""type"": ""string"" }
+        }
+      },
+      ""ErrorResponse"": {
+        ""type"": ""object"",
+        ""properties"": { ""error"": { ""type"": ""string"" } }
+      },
+      ""SelectionResponse"": {
+        ""type"": ""object"",
+        ""properties"": {
+          ""count"":        { ""type"": ""integer"" },
+          ""activeObject"": { ""$ref"": ""#/components/schemas/SelectedObject"", ""nullable"": true },
+          ""objects"":      { ""type"": ""array"", ""items"": { ""$ref"": ""#/components/schemas/SelectedObject"" } }
+        }
+      },
+      ""SelectedObject"": {
+        ""type"": ""object"",
+        ""properties"": {
+          ""name"":      { ""type"": ""string"" },
+          ""type"":      { ""type"": ""string"", ""description"": ""C# type name, e.g. GameObject, MonoScript, Texture2D"" },
+          ""assetPath"": { ""type"": ""string"", ""nullable"": true, ""description"": ""Asset path if the object is a project asset; null for scene objects"" }
         }
       },
       ""RunRequest"": {
@@ -1229,7 +1410,7 @@ public class HttpServerConsoleLink
 
     static EntityId ScriptInstanceId()
     {
-        if (_scriptInstanceId != EntityId.None) return _scriptInstanceId;
+        if (_scriptInstanceId.IsValid()) return _scriptInstanceId;
         foreach (var guid in AssetDatabase.FindAssets("TestHttpServer t:MonoScript"))
         {
             var script = AssetDatabase.LoadAssetAtPath<MonoScript>(

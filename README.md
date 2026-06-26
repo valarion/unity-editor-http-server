@@ -15,6 +15,8 @@ A Unity Editor package that exposes an HTTP API on `localhost:8765`, giving AI a
 | `POST` | `/tests/run` | Run tests with optional glob filter and minimal output mode |
 | `GET`  | `/logs` | Rolling console log buffer (last 500 entries) |
 | `POST` | `/logs/clear` | Clear the log buffer |
+| `GET`  | `/editor/screenshot` | Capture the Game view as a PNG image |
+| `GET`  | `/editor/selection` | Currently selected objects in the Editor |
 | `GET`  | `/swagger` | Swagger UI |
 | `GET`  | `/swagger/openapi.json` | OpenAPI 3.0 spec |
 
