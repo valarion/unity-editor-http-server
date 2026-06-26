@@ -1227,7 +1227,9 @@ public class HttpServerConsoleLink
     static bool OnOpenAsset(int instanceID, int line)
     {
         if (!TestHttpServer.IsRunning) return false;
-        var path = AssetDatabase.GetAssetPath(instanceID);
+        var obj = EditorUtility.InstanceIDToObject(instanceID);
+        if (obj == null) return false;
+        var path = AssetDatabase.GetAssetPath(obj);
         if (!path.EndsWith("TestHttpServer.cs", StringComparison.OrdinalIgnoreCase)) return false;
         Application.OpenURL($"http://localhost:{TestHttpServer.ConfiguredPort}/swagger");
         return true;   // consumed — skip opening the script editor
